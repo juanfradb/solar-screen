@@ -1,0 +1,16 @@
+[Unit]
+Description=Local solar spectrum display controller
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/solar-screen daemon
+ExecStopPost=-%h/.local/bin/solar-screen reset
+Restart=on-failure
+RestartSec=2
+Nice=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target
