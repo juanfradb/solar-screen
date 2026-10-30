@@ -49,6 +49,10 @@ solar-screen enable
 display LUT. `disable` restores the exact baseline LUT and the previous GNOME
 Night Light setting.
 
+The user service starts at login, before the graphical session, finds the X
+display and re-applies the ramp every second. Compositor resets (session
+start, resume, monitor changes) are corrected within a second.
+
 ## GDM login screen
 
 The session service only starts after login. To keep the same white point on
@@ -75,8 +79,7 @@ the deployed copy, not the git checkout.
 
 ## Model
 
-- NOAA apparent solar elevation, calculated in UTC every five seconds (one
-  second in the greeter).
+- NOAA apparent solar elevation, calculated in UTC every second.
 - Bird SPECTRL2 clear-sky direct-normal spectral irradiance.
 - CIE 1931 2° color matching functions and sRGB conversion.
 - Exact sRGB EOTF/OETF composition over the existing XRandR baseline.

@@ -3,5 +3,5 @@
   "longitude": 0.0,
   "altitude_m": 0.0,
   "red_only_below_elevation": -6.0,
-  "update_seconds": 5.0
+  "update_seconds": 1.0
 }

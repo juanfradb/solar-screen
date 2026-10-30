@@ -52,7 +52,7 @@ GNOME_KEY = "night-light-enabled"
 
 DEFAULT_CONFIG = {
     "red_only_below_elevation": -6.0,
-    "update_seconds": 5.0,
+    "update_seconds": 1.0,
 }
 
 
@@ -580,12 +580,46 @@ class MutterDisplayConfig:
         )
 
 
+def discover_x11_display() -> None:
+    """Find the session's X server when DISPLAY was not exported yet."""
+    if os.environ.get("DISPLAY"):
+        return
+    sockets = sorted(
+        Path("/tmp/.X11-unix").glob("X[0-9]*"),
+        key=lambda path: (len(path.name), path.name),
+    )
+    if not sockets:
+        return
+    authority = os.environ.get("XAUTHORITY")
+    if not authority or not Path(authority).exists():
+        for candidate in (
+            Path(f"/run/user/{os.getuid()}/gdm/Xauthority"),
+            Path.home() / ".Xauthority",
+        ):
+            if candidate.exists():
+                authority = str(candidate)
+                break
+    for socket in sockets:
+        os.environ["DISPLAY"] = ":" + socket.name[1:]
+        if authority:
+            os.environ["XAUTHORITY"] = authority
+        try:
+            backend = XRandR()
+        except Exception:
+            continue
+        backend.close()
+        return
+    os.environ.pop("DISPLAY", None)
+
+
 def create_backend() -> XRandR | MutterDisplayConfig:
     preferred = os.environ.get("SOLAR_SCREEN_BACKEND", "auto")
     if preferred == "wayland":
         preferred = "mutter"
     if preferred not in ("auto", "x11", "mutter"):
         raise RuntimeError(f"unknown SOLAR_SCREEN_BACKEND value: {preferred}")
+    if preferred in ("auto", "x11"):
+        discover_x11_display()
     # XWayland exposes XRandR but its gamma ramps do not reach the CRTC.
     backends = (
         ("mutter", "x11")
@@ -1059,8 +1093,9 @@ def daemon(stop_event: threading.Event | None = None) -> int:
 def daemon_supervised() -> int:
     """Run the daemon, waiting for a compositor that comes and goes.
 
-    Used by the GDM greeter service: the session bus and mutter only exist
-    while the login screen is up.
+    Used by the greeter and by the login-time service: the session bus and
+    the display server may not exist yet, and the greeter's compositor is
+    destroyed at logout.
     """
     stopping = threading.Event()
 
@@ -1070,6 +1105,18 @@ def daemon_supervised() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     bus_path = RUNTIME_DIR.parent / "bus"
+    last_error = ""
+    last_error_time = 0.0
+
+    def report(prefix: str, error: Exception) -> None:
+        nonlocal last_error, last_error_time
+        message = str(error)
+        now = time.monotonic()
+        if message != last_error or now - last_error_time >= 60.0:
+            log(f"solar-screen: {prefix}: {message}")
+            last_error = message
+            last_error_time = now
+
     while not stopping.is_set():
         runtime_ready = RUNTIME_DIR.parent.is_dir()
         session_ready = bool(
@@ -1079,9 +1126,16 @@ def daemon_supervised() -> int:
             if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
                 os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
             try:
+                probe = create_backend()
+                probe.close()
+            except Exception as error:
+                report("waiting for a display", error)
+                stopping.wait(1.0)
+                continue
+            try:
                 return daemon(stopping)
             except Exception as error:
-                log(f"solar-screen: display session unavailable: {error}")
+                report("display session unavailable", error)
         stopping.wait(1.0)
     return 0
 
@@ -1154,7 +1208,8 @@ def enable() -> int:
         disable_gnome_night_light(wait=True)
         install_unit()
         systemctl("daemon-reload")
-        systemctl("enable", "--now", "solar-screen.service")
+        systemctl("reenable", "solar-screen.service")
+        systemctl("restart", "solar-screen.service")
         deadline = time.monotonic() + 20.0
         while not service_ready() and time.monotonic() < deadline:
             time.sleep(0.1)
