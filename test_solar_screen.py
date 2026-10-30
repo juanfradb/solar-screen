@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from solar_screen import (
+    MutterDisplayConfig,
     OutputInfo,
     compose_ramp,
+    create_backend,
     decode_ramp,
     encode_ramp,
     identity_ramp,
@@ -104,6 +108,109 @@ class GammaRampTests(unittest.TestCase):
         }
         state = output_state_from_current(OutputInfo("test", 7, 3), current, previous)
         self.assertEqual(state.baseline, baseline)
+
+
+class MutterBackendTests(unittest.TestCase):
+    def test_crtc_is_active_uses_layout_size(self):
+        self.assertTrue(
+            MutterDisplayConfig._crtc_is_active(
+                (0, 78, 0, 0, 1920, 1080, 0, 0, [], {})
+            )
+        )
+        self.assertFalse(
+            MutterDisplayConfig._crtc_is_active(
+                (1, 79, 0, 0, 0, 0, -1, 0, [], {})
+            )
+        )
+
+    def test_active_outputs_seeds_empty_ramp(self):
+        backend = object.__new__(MutterDisplayConfig)
+        writes = {}
+        backend._resources = lambda: (
+            7,
+            [(0, 78, 0, 0, 1920, 1080, 0, 0, [0], {})],
+        )
+        backend._gamma = lambda serial, crtc: ((), (), ())
+        backend.set_ramp = lambda info, ramp: writes.setdefault(
+            info.name, (info.size, ramp)
+        )
+        outputs = backend.active_outputs()
+        self.assertEqual(
+            outputs["mutter-crtc-0"].size, MutterDisplayConfig.DEFAULT_LUT_SIZE
+        )
+        self.assertEqual(
+            writes["mutter-crtc-0"][1],
+            identity_ramp(MutterDisplayConfig.DEFAULT_LUT_SIZE),
+        )
+
+    def test_active_outputs_keeps_existing_ramp(self):
+        backend = object.__new__(MutterDisplayConfig)
+        ramp = identity_ramp(64)
+        backend._resources = lambda: (
+            1,
+            [(2, 80, 0, 0, 1280, 720, 1, 0, [0], {})],
+        )
+        backend._gamma = lambda serial, crtc: ramp
+        backend.set_ramp = lambda info, value: self.fail("must not write")
+        outputs = backend.active_outputs()
+        self.assertEqual(outputs["mutter-crtc-2"].size, 64)
+
+    def test_active_outputs_skips_inactive_crtc(self):
+        backend = object.__new__(MutterDisplayConfig)
+        backend._resources = lambda: (
+            1,
+            [(1, 79, 0, 0, 0, 0, -1, 0, [], {})],
+        )
+        backend._gamma = lambda serial, crtc: self.fail("must not read")
+        self.assertEqual(backend.active_outputs(), {})
+
+
+class BackendSelectionTests(unittest.TestCase):
+    def test_wayland_prefers_mutter(self):
+        calls = []
+        environment = {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"}
+        with patch.dict(os.environ, environment, clear=False):
+            with patch(
+                "solar_screen.XRandR", lambda: calls.append("x11") or "x11"
+            ), patch(
+                "solar_screen.MutterDisplayConfig",
+                lambda: calls.append("mutter") or "mutter",
+            ):
+                self.assertEqual(create_backend(), "mutter")
+        self.assertEqual(calls, ["mutter"])
+
+    def test_x11_prefers_xrandr(self):
+        calls = []
+        environment = {"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
+        with patch.dict(os.environ, environment, clear=False):
+            with patch(
+                "solar_screen.XRandR", lambda: calls.append("x11") or "x11"
+            ), patch(
+                "solar_screen.MutterDisplayConfig",
+                lambda: calls.append("mutter") or "mutter",
+            ):
+                self.assertEqual(create_backend(), "x11")
+        self.assertEqual(calls, ["x11"])
+
+    def test_falls_back_to_mutter(self):
+        def broken_x11():
+            raise RuntimeError("cannot open display")
+
+        with patch.dict(
+            os.environ,
+            {"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"},
+            clear=False,
+        ), patch("solar_screen.XRandR", broken_x11), patch(
+            "solar_screen.MutterDisplayConfig", lambda: "mutter"
+        ):
+            self.assertEqual(create_backend(), "mutter")
+
+    def test_unknown_backend_is_rejected(self):
+        with patch.dict(
+            os.environ, {"SOLAR_SCREEN_BACKEND": "bogus"}, clear=False
+        ):
+            with self.assertRaises(RuntimeError):
+                create_backend()
 
 
 if __name__ == "__main__":

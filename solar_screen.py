@@ -460,6 +460,9 @@ class MutterDisplayConfig:
     BUS_NAME = "org.gnome.Mutter.DisplayConfig"
     OBJECT_PATH = "/org/gnome/Mutter/DisplayConfig"
     INTERFACE = "org.gnome.Mutter.DisplayConfig"
+    # Mutter exposes no ramp until one is written, so it also exposes no size.
+    # Any size works: the KMS update resamples to the CRTC's real LUT size.
+    DEFAULT_LUT_SIZE = 1024
 
     def __init__(self) -> None:
         try:
@@ -493,6 +496,9 @@ class MutterDisplayConfig:
         )
         if self.proxy.get_name_owner() is None:
             raise RuntimeError(f"{self.BUS_NAME} is not available")
+        supported = self.proxy.get_cached_property("NightLightSupported")
+        if supported is not None and not supported.unpack():
+            raise RuntimeError("mutter reports no gamma LUT support")
 
     def close(self) -> None:
         self.proxy = None
@@ -536,9 +542,13 @@ class MutterDisplayConfig:
             crtc_id = int(crtc[0])
             ramp = self._gamma(serial, crtc_id)
             size = len(ramp[0])
+            name = f"mutter-crtc-{crtc_id}"
             if size < 2:
-                continue
-            name = f"crtc-{crtc_id}"
+                # No cached LUT yet (common when no ICC profile is assigned):
+                # seed an identity ramp so the size is known and the KMS
+                # commit has a baseline. Mutter resamples it as needed.
+                size = self.DEFAULT_LUT_SIZE
+                self.set_ramp(OutputInfo(name, crtc_id, size), identity_ramp(size))
             result[name] = OutputInfo(name, crtc_id, size)
         return result
 
@@ -592,12 +602,12 @@ def create_backend() -> XRandR | MutterDisplayConfig:
                 continue
             try:
                 return XRandR()
-            except RuntimeError as error:
+            except Exception as error:
                 errors.append(str(error))
         else:
             try:
                 return MutterDisplayConfig()
-            except RuntimeError as error:
+            except Exception as error:
                 errors.append(str(error))
     raise RuntimeError("no display backend available: " + "; ".join(errors))
 
@@ -925,7 +935,8 @@ def daemon(stop_event: threading.Event | None = None) -> int:
     except BlockingIOError:
         raise RuntimeError("another solar-screen daemon is running")
 
-    if os.environ.get("SOLAR_SCREEN_MANAGE_GNOME", "1") != "0":
+    manage_gnome = os.environ.get("SOLAR_SCREEN_MANAGE_GNOME", "1") != "0"
+    if manage_gnome:
         disable_gnome_night_light(wait=True)
     backend = create_backend()
     wait_for_stable_ramps(backend)
@@ -951,7 +962,7 @@ def daemon(stop_event: threading.Event | None = None) -> int:
     try:
         while not stopping.is_set():
             monotonic_now = time.monotonic()
-            if monotonic_now >= next_gnome_check:
+            if manage_gnome and monotonic_now >= next_gnome_check:
                 if disable_gnome_night_light(wait=True):
                     wait_for_stable_ramps(backend)
                 next_gnome_check = monotonic_now + 30.0
@@ -990,8 +1001,14 @@ def daemon(stop_event: threading.Event | None = None) -> int:
                     log(f"{name}: controlling CRTC {info.crtc}, LUT {info.size}")
                 elif current_hash != state.last_hash:
                     if current_hash != state.baseline_hash:
-                        log(f"{name}: external LUT change adopted as new baseline")
-                        state.baseline = current
+                        if identity_baseline:
+                            log(
+                                f"{name}: external LUT change ignored "
+                                "(identity baseline)"
+                            )
+                        else:
+                            log(f"{name}: external LUT change adopted as new baseline")
+                            state.baseline = current
                     state.last_hash = current_hash
 
                 desired = compose_ramp(state.baseline, target.rgb)
@@ -1027,10 +1044,13 @@ def daemon(stop_event: threading.Event | None = None) -> int:
         try:
             count = restore_owned(backend, outputs)
             log(f"restored {count} output(s)")
-            persist_runtime_state(outputs, target, False, False)
         except Exception as error:
             log(f"solar-screen: could not restore gamma ramps: {error}")
         finally:
+            try:
+                persist_runtime_state(outputs, target, False, False)
+            except Exception as error:
+                log(f"solar-screen: could not persist state: {error}")
             backend.close()
             lock_stream.close()
     return 0

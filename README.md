@@ -59,22 +59,24 @@ greeter hook:
 sudo ./install-greeter.sh
 ```
 
-It deploys the controller to `/usr/local/lib/solar-screen`, copies the
-configuration to `/etc/solar-screen/config.json` (with a one-second refresh),
-and adds `/usr/share/gdm/greeter/autostart/solar-screen-greeter.desktop`, which
-GDM's `gnome-session --autostart` runs inside the greeter session. That gives
-the daemon the greeter's private D-Bus address, which lives in `/tmp` and is
-not reachable from a regular system service. The daemon talks to mutter's
+It deploys the controller to `/usr/local/lib/solar-screen`, seeds
+`/etc/solar-screen/config.json` from your user configuration on first install
+(one-second refresh; edit it if your location changes), and adds
+`/usr/share/gdm/greeter/autostart/solar-screen-greeter.desktop`, which GDM's
+`gnome-session --autostart` runs inside the greeter session. That gives the
+daemon the greeter's private D-Bus address, which lives in `/tmp` and is not
+reachable from a regular system service. The daemon talks to mutter's
 `org.gnome.Mutter.DisplayConfig` API, so it works on Wayland where clients
 cannot write the CRTC directly, and re-applies the ramp if the compositor's
-color manager overwrites it.
+color manager overwrites it. Requires `gdm3`.
 
 Re-run `install-greeter.sh` after changing `solar_screen.py`; the greeter uses
 the deployed copy, not the git checkout.
 
 ## Model
 
-- NOAA apparent solar elevation, calculated in UTC every five seconds.
+- NOAA apparent solar elevation, calculated in UTC every five seconds (one
+  second in the greeter).
 - Bird SPECTRL2 clear-sky direct-normal spectral irradiance.
 - CIE 1931 2° color matching functions and sRGB conversion.
 - Exact sRGB EOTF/OETF composition over the existing XRandR baseline.

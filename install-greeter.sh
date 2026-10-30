@@ -26,6 +26,19 @@ if ! /usr/bin/python3 -c 'import gi' 2>/dev/null; then
     echo "python3-gi is required for the greeter (sudo apt install python3-gi)" >&2
     exit 1
 fi
+if [[ ! -x /usr/sbin/gdm3 ]]; then
+    echo "warning: GDM was not found; this hook only runs under gdm3" >&2
+fi
+
+# Resolve the invoking user's config even when the script is run with sudo.
+if [[ ${EUID} -eq 0 && -n ${SUDO_USER:-} ]]; then
+    owner_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    [[ -n $owner_home ]] || owner_home="$HOME"
+    owner_config_home="$owner_home/.config"
+else
+    owner_config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+fi
+source_config="${SOLAR_SCREEN_GREETER_CONFIG:-$owner_config_home/solar-screen/config.json}"
 
 # Remove the system service used by earlier revisions: the greeter's session
 # bus is not reachable from outside the session.
@@ -36,15 +49,13 @@ if [[ -e "$OLD_UNIT" ]]; then
 fi
 
 "${SUDO[@]}" install -d -m 0755 "$DEST_DIR" "$CONFIG_DIR" "$AUTOSTART_DIR"
-"${SUDO[@]}" install -m 0755 "$APP_DIR/solar_screen.py" "$DEST_DIR/solar_screen.py"
-"${SUDO[@]}" install -m 0644 "$APP_DIR/solar_table.py" "$DEST_DIR/solar_table.py"
-"${SUDO[@]}" install -m 0755 "$APP_DIR/solar-screen-greeter.sh" "$DEST_DIR/solar-screen-greeter"
-"${SUDO[@]}" install -m 0644 "$APP_DIR/solar-screen-greeter.desktop" "$AUTOSTART_FILE"
 
+# Create the config before installing anything else, so a missing source
+# config fails the install without leaving a half-configured greeter.
 if [[ ! -e "$CONFIG_FILE" ]]; then
-    source_config="${XDG_CONFIG_HOME:-$HOME/.config}/solar-screen/config.json"
     if [[ ! -f "$source_config" ]]; then
-        echo "missing $source_config; run 'solar-screen enable' first" >&2
+        echo "missing $source_config; create it (see README) or set" >&2
+        echo "SOLAR_SCREEN_GREETER_CONFIG to another configuration file" >&2
         exit 1
     fi
     temporary="$(mktemp)"
@@ -64,6 +75,11 @@ with open(sys.argv[2], "w", encoding="utf-8") as stream:
 PY
     "${SUDO[@]}" install -m 0644 "$temporary" "$CONFIG_FILE"
 fi
+
+"${SUDO[@]}" install -m 0755 "$APP_DIR/solar_screen.py" "$DEST_DIR/solar_screen.py"
+"${SUDO[@]}" install -m 0644 "$APP_DIR/solar_table.py" "$DEST_DIR/solar_table.py"
+"${SUDO[@]}" install -m 0755 "$APP_DIR/solar-screen-greeter.sh" "$DEST_DIR/solar-screen-greeter"
+"${SUDO[@]}" install -m 0644 "$APP_DIR/solar-screen-greeter.desktop" "$AUTOSTART_FILE"
 
 echo "greeter filter installed."
 echo "It will start with the next GDM greeter (logout or reboot)."
