@@ -8,6 +8,7 @@ from solar_screen import (
     compose_ramp,
     decode_ramp,
     encode_ramp,
+    identity_ramp,
     output_state_from_current,
     ramp_hash,
     solar_elevation,
@@ -76,6 +77,15 @@ class GammaRampTests(unittest.TestCase):
     def test_round_trip_encoding(self):
         ramp = ((0, 1, 65535), (2, 3, 4), (5, 6, 7))
         self.assertEqual(decode_ramp(encode_ramp(ramp), 3), ramp)
+
+    def test_identity_ramp(self):
+        ramp = identity_ramp(1024)
+        self.assertEqual(len(ramp), 3)
+        self.assertEqual(ramp[0][0], 0)
+        self.assertEqual(ramp[0][-1], 65535)
+        self.assertEqual(ramp[0], ramp[1])
+        self.assertEqual(ramp[1], ramp[2])
+        self.assertTrue(all(a <= b for a, b in zip(ramp[0], ramp[0][1:])))
 
     def test_pre_write_crash_keeps_original_baseline(self):
         baseline = ((0, 32768, 65535),) * 3
