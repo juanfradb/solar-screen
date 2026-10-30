@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Solar Screen Greeter
+Comment=Match the login screen to the modeled local sunlight
+Exec=/usr/local/lib/solar-screen/solar-screen-greeter
+X-GNOME-Autostart-enabled=true
+X-GNOME-AutoRestart=true
+NoDisplay=true

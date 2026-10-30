@@ -35,6 +35,13 @@ CONFIG_PATH = Path(
 RUNTIME_DIR = (
     Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "solar-screen"
 )
+# System services (the GDM greeter) get no session environment, only a uid.
+if "XDG_RUNTIME_DIR" not in os.environ:
+    os.environ["XDG_RUNTIME_DIR"] = str(RUNTIME_DIR.parent)
+if "DBUS_SESSION_BUS_ADDRESS" not in os.environ:
+    _session_bus = RUNTIME_DIR.parent / "bus"
+    if _session_bus.exists():
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={_session_bus}"
 RUNTIME_STATE = RUNTIME_DIR / "state.json"
 LOCK_PATH = RUNTIME_DIR / "daemon.lock"
 PERSISTENT_DIR = Path.home() / ".local/state/solar-screen"
@@ -45,7 +52,7 @@ GNOME_KEY = "night-light-enabled"
 
 DEFAULT_CONFIG = {
     "red_only_below_elevation": -6.0,
-    "update_seconds": 5.0,
+    "update_seconds": 1.0,
 }
 
 
@@ -441,6 +448,213 @@ class XRandR:
             self.randr.XRRFreeGamma(pointer)
 
 
+class MutterDisplayConfig:
+    """Gamma backend through mutter's display-config D-Bus API.
+
+    Works on Wayland, where clients cannot touch the CRTC directly, and is
+    also valid on X11. Mutter keeps the ramp per CRTC; the compositor's color
+    manager may overwrite it when it applies its own LUT, so the daemon keeps
+    polling and re-applying.
+    """
+
+    BUS_NAME = "org.gnome.Mutter.DisplayConfig"
+    OBJECT_PATH = "/org/gnome/Mutter/DisplayConfig"
+    INTERFACE = "org.gnome.Mutter.DisplayConfig"
+    # Mutter exposes no ramp until one is written, so it also exposes no size.
+    # Any size works: the KMS update resamples to the CRTC's real LUT size.
+    DEFAULT_LUT_SIZE = 1024
+
+    def __init__(self) -> None:
+        try:
+            import gi
+
+            from gi.repository import Gio, GLib
+        except ImportError as error:
+            raise RuntimeError(
+                "PyGObject (python3-gi) is required for the mutter backend"
+            ) from error
+        self._gio = Gio
+        self._glib = GLib
+        if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+            session_bus = RUNTIME_DIR.parent / "bus"
+            if session_bus.exists():
+                os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={session_bus}"
+        try:
+            self.connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except GLib.Error as error:
+            raise RuntimeError(
+                f"cannot connect to the session bus: {error.message}"
+            ) from error
+        self.proxy = Gio.DBusProxy.new_sync(
+            self.connection,
+            Gio.DBusProxyFlags.DO_NOT_AUTO_START,
+            None,
+            self.BUS_NAME,
+            self.OBJECT_PATH,
+            self.INTERFACE,
+            None,
+        )
+        if self.proxy.get_name_owner() is None:
+            raise RuntimeError(f"{self.BUS_NAME} is not available")
+        supported = self.proxy.get_cached_property("NightLightSupported")
+        if supported is not None and not supported.unpack():
+            raise RuntimeError("mutter reports no gamma LUT support")
+
+    def close(self) -> None:
+        self.proxy = None
+        self.connection = None
+
+    def _call(self, method: str, parameters=None):
+        return self.proxy.call_sync(
+            method,
+            parameters,
+            self._gio.DBusCallFlags.NONE,
+            5000,
+            None,
+        )
+
+    def _resources(self) -> tuple[int, list]:
+        reply = self._call("GetResources")
+        serial, crtcs, _outputs, _modes, _width, _height = reply.unpack()
+        return int(serial), crtcs
+
+    def _gamma(self, serial: int, crtc: int) -> Ramp:
+        reply = self._call(
+            "GetCrtcGamma", self._glib.Variant("(uu)", (serial, crtc))
+        )
+        red, green, blue = reply.unpack()
+        return (
+            tuple(int(value) for value in red),
+            tuple(int(value) for value in green),
+            tuple(int(value) for value in blue),
+        )
+
+    @staticmethod
+    def _crtc_is_active(crtc: tuple) -> bool:
+        return int(crtc[4]) > 0 and int(crtc[5]) > 0
+
+    def active_outputs(self) -> dict[str, OutputInfo]:
+        serial, crtcs = self._resources()
+        result: dict[str, OutputInfo] = {}
+        for crtc in crtcs:
+            if not self._crtc_is_active(crtc):
+                continue
+            crtc_id = int(crtc[0])
+            ramp = self._gamma(serial, crtc_id)
+            size = len(ramp[0])
+            name = f"mutter-crtc-{crtc_id}"
+            if size < 2:
+                # No cached LUT yet (common when no ICC profile is assigned):
+                # seed an identity ramp so the size is known and the KMS
+                # commit has a baseline. Mutter resamples it as needed.
+                size = self.DEFAULT_LUT_SIZE
+                self.set_ramp(OutputInfo(name, crtc_id, size), identity_ramp(size))
+            result[name] = OutputInfo(name, crtc_id, size)
+        return result
+
+    def get_ramp(self, output: OutputInfo) -> Ramp:
+        serial, _crtcs = self._resources()
+        ramp = self._gamma(serial, output.crtc)
+        if any(len(channel) != output.size for channel in ramp):
+            raise RuntimeError(
+                f"gamma size changed for {output.name}: "
+                f"{output.size} -> {len(ramp[0])}"
+            )
+        return ramp
+
+    def set_ramp(self, output: OutputInfo, ramp: Ramp) -> None:
+        if any(len(channel) != output.size for channel in ramp):
+            raise ValueError("gamma ramp has wrong size")
+        serial, crtcs = self._resources()
+        if not any(
+            int(crtc[0]) == output.crtc and self._crtc_is_active(crtc)
+            for crtc in crtcs
+        ):
+            raise RuntimeError(f"{output.name}: CRTC is no longer active")
+        self._call(
+            "SetCrtcGamma",
+            self._glib.Variant(
+                "(uuaqaqaq)",
+                (serial, output.crtc, list(ramp[0]), list(ramp[1]), list(ramp[2])),
+            ),
+        )
+
+
+def discover_x11_display() -> None:
+    """Find the session's X server when DISPLAY was not exported yet."""
+    if os.environ.get("DISPLAY"):
+        return
+    sockets = sorted(
+        Path("/tmp/.X11-unix").glob("X[0-9]*"),
+        key=lambda path: (len(path.name), path.name),
+    )
+    if not sockets:
+        return
+    authority = os.environ.get("XAUTHORITY")
+    if not authority or not Path(authority).exists():
+        for candidate in (
+            Path(f"/run/user/{os.getuid()}/gdm/Xauthority"),
+            Path.home() / ".Xauthority",
+        ):
+            if candidate.exists():
+                authority = str(candidate)
+                break
+    for socket in sockets:
+        os.environ["DISPLAY"] = ":" + socket.name[1:]
+        if authority:
+            os.environ["XAUTHORITY"] = authority
+        try:
+            backend = XRandR()
+        except Exception:
+            continue
+        backend.close()
+        return
+    os.environ.pop("DISPLAY", None)
+
+
+def create_backend() -> XRandR | MutterDisplayConfig:
+    preferred = os.environ.get("SOLAR_SCREEN_BACKEND", "auto")
+    if preferred == "wayland":
+        preferred = "mutter"
+    if preferred not in ("auto", "x11", "mutter"):
+        raise RuntimeError(f"unknown SOLAR_SCREEN_BACKEND value: {preferred}")
+    if preferred in ("auto", "x11"):
+        discover_x11_display()
+    # XWayland exposes XRandR but its gamma ramps do not reach the CRTC.
+    backends = (
+        ("mutter", "x11")
+        if os.environ.get("XDG_SESSION_TYPE") == "wayland"
+        else ("x11", "mutter")
+    )
+    errors: list[str] = []
+    for backend in backends:
+        if preferred not in ("auto", backend):
+            continue
+        if backend == "x11":
+            if not os.environ.get("DISPLAY"):
+                errors.append("DISPLAY is not set")
+                continue
+            try:
+                return XRandR()
+            except Exception as error:
+                errors.append(str(error))
+        else:
+            try:
+                return MutterDisplayConfig()
+            except Exception as error:
+                errors.append(str(error))
+    raise RuntimeError("no display backend available: " + "; ".join(errors))
+
+
+def identity_ramp(size: int) -> Ramp:
+    if size < 2:
+        raise ValueError("gamma ramp size must be at least 2")
+    return tuple(
+        tuple(round(65535.0 * index / (size - 1)) for index in range(size))
+        for _ in range(3)
+    )  # type: ignore[return-value]
+
+
 def ramp_bytes(ramp: Ramp) -> bytes:
     values = array.array("H")
     for channel in ramp:
@@ -623,7 +837,9 @@ def disable_gnome_night_light(wait: bool = True) -> bool:
     return changed
 
 
-def wait_for_stable_ramps(backend: XRandR, timeout: float = 10.0) -> None:
+def wait_for_stable_ramps(
+    backend: XRandR | MutterDisplayConfig, timeout: float = 10.0
+) -> None:
     deadline = time.monotonic() + timeout
     stable_since = time.monotonic()
     previous: tuple[tuple[str, int, str], ...] | None = None
@@ -686,7 +902,9 @@ def persist_runtime_state(
 
 
 def restore_owned(
-    backend: XRandR, outputs: dict[str, OutputState], update_hash: bool = True
+    backend: XRandR | MutterDisplayConfig,
+    outputs: dict[str, OutputState],
+    update_hash: bool = True,
 ) -> int:
     restored = 0
     active = backend.active_outputs()
@@ -717,7 +935,7 @@ def restore_from_saved_state() -> int:
     previous_outputs = saved.get("outputs", {})
     if not isinstance(previous_outputs, dict):
         return 0
-    backend = XRandR()
+    backend = create_backend()
     states: dict[str, OutputState] = {}
     try:
         active = backend.active_outputs()
@@ -742,7 +960,7 @@ def restore_from_saved_state() -> int:
         backend.close()
 
 
-def daemon() -> int:
+def daemon(stop_event: threading.Event | None = None) -> int:
     config = load_config()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     lock_stream = LOCK_PATH.open("w")
@@ -751,21 +969,26 @@ def daemon() -> int:
     except BlockingIOError:
         raise RuntimeError("another solar-screen daemon is running")
 
-    disable_gnome_night_light(wait=True)
-    backend = XRandR()
+    manage_gnome = os.environ.get("SOLAR_SCREEN_MANAGE_GNOME", "1") != "0"
+    if manage_gnome:
+        disable_gnome_night_light(wait=True)
+    backend = create_backend()
     wait_for_stable_ramps(backend)
     saved = read_json(RUNTIME_STATE)
     previous = (
         saved.get("outputs", {}) if isinstance(saved.get("outputs"), dict) else {}
     )
     outputs: dict[str, OutputState] = {}
-    stopping = threading.Event()
+    identity_baseline = os.environ.get("SOLAR_SCREEN_BASELINE") == "identity"
+    stopping = stop_event if stop_event is not None else threading.Event()
 
-    def stop(_signum: int, _frame: object) -> None:
-        stopping.set()
+    if stop_event is None:
 
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
+        def stop(_signum: int, _frame: object) -> None:
+            stopping.set()
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
     last_mode = ""
     next_gnome_check = 0.0
     next_log = 0.0
@@ -773,7 +996,7 @@ def daemon() -> int:
     try:
         while not stopping.is_set():
             monotonic_now = time.monotonic()
-            if monotonic_now >= next_gnome_check:
+            if manage_gnome and monotonic_now >= next_gnome_check:
                 if disable_gnome_night_light(wait=True):
                     wait_for_stable_ramps(backend)
                 next_gnome_check = monotonic_now + 30.0
@@ -798,12 +1021,28 @@ def daemon() -> int:
                     or state.info.size != info.size
                 ):
                     state = output_state_from_current(info, current, previous.get(name))
+                    if identity_baseline:
+                        # The greeter has no user calibration; never compound
+                        # with a LUT left behind by a previous session.
+                        baseline = identity_ramp(info.size)
+                        state = OutputState(
+                            info,
+                            baseline,
+                            current_hash,
+                            {current_hash, ramp_hash(baseline)},
+                        )
                     outputs[name] = state
                     log(f"{name}: controlling CRTC {info.crtc}, LUT {info.size}")
                 elif current_hash != state.last_hash:
                     if current_hash != state.baseline_hash:
-                        log(f"{name}: external LUT change adopted as new baseline")
-                        state.baseline = current
+                        if identity_baseline:
+                            log(
+                                f"{name}: external LUT change ignored "
+                                "(identity baseline)"
+                            )
+                        else:
+                            log(f"{name}: external LUT change adopted as new baseline")
+                            state.baseline = current
                     state.last_hash = current_hash
 
                 desired = compose_ramp(state.baseline, target.rgb)
@@ -839,10 +1078,65 @@ def daemon() -> int:
         try:
             count = restore_owned(backend, outputs)
             log(f"restored {count} output(s)")
-            persist_runtime_state(outputs, target, False, False)
+        except Exception as error:
+            log(f"solar-screen: could not restore gamma ramps: {error}")
         finally:
+            try:
+                persist_runtime_state(outputs, target, False, False)
+            except Exception as error:
+                log(f"solar-screen: could not persist state: {error}")
             backend.close()
             lock_stream.close()
+    return 0
+
+
+def daemon_supervised() -> int:
+    """Run the daemon, waiting for a compositor that comes and goes.
+
+    Used by the greeter and by the login-time service: the session bus and
+    the display server may not exist yet, and the greeter's compositor is
+    destroyed at logout.
+    """
+    stopping = threading.Event()
+
+    def stop(_signum: int, _frame: object) -> None:
+        stopping.set()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    bus_path = RUNTIME_DIR.parent / "bus"
+    last_error = ""
+    last_error_time = 0.0
+
+    def report(prefix: str, error: Exception) -> None:
+        nonlocal last_error, last_error_time
+        message = str(error)
+        now = time.monotonic()
+        if message != last_error or now - last_error_time >= 60.0:
+            log(f"solar-screen: {prefix}: {message}")
+            last_error = message
+            last_error_time = now
+
+    while not stopping.is_set():
+        runtime_ready = RUNTIME_DIR.parent.is_dir()
+        session_ready = bool(
+            os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+        ) or bus_path.exists()
+        if runtime_ready and session_ready:
+            if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+                os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+            try:
+                probe = create_backend()
+                probe.close()
+            except Exception as error:
+                report("waiting for a display", error)
+                stopping.wait(1.0)
+                continue
+            try:
+                return daemon(stopping)
+            except Exception as error:
+                report("display session unavailable", error)
+        stopping.wait(1.0)
     return 0
 
 
@@ -914,7 +1208,8 @@ def enable() -> int:
         disable_gnome_night_light(wait=True)
         install_unit()
         systemctl("daemon-reload")
-        systemctl("enable", "--now", "solar-screen.service")
+        systemctl("reenable", "solar-screen.service")
+        systemctl("restart", "solar-screen.service")
         deadline = time.monotonic() + 20.0
         while not service_ready() and time.monotonic() < deadline:
             time.sleep(0.1)
@@ -982,13 +1277,19 @@ def parse_args() -> argparse.Namespace:
         default="status",
         choices=("status", "enable", "disable", "daemon", "reset"),
     )
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="with daemon: wait for the display session to appear",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
-    command = parse_args().command
+    arguments = parse_args()
+    command = arguments.command
     if command == "daemon":
-        return daemon()
+        return daemon_supervised() if arguments.wait else daemon()
     if command == "enable":
         return enable()
     if command == "disable":
