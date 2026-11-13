@@ -580,6 +580,61 @@ class MutterDisplayConfig:
         )
 
 
+X11_PROBE = (
+    "import ctypes, ctypes.util, sys; "
+    "x = ctypes.CDLL(ctypes.util.find_library('X11') or 'libX11.so.6'); "
+    "x.XOpenDisplay.restype = ctypes.c_void_p; "
+    "sys.exit(0 if x.XOpenDisplay(None) else 1)"
+)
+
+
+def x11_display_opens(timeout: float = 3.0) -> bool:
+    """Probe $DISPLAY in a child: XOpenDisplay can block forever.
+
+    Mutter's GNOME_SETUP_DISPLAY socket stops accepting once the session is
+    up; libxcb then waits on its full backlog with no timeout.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", X11_PROBE],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0
+
+
+def logind_session_type() -> str:
+    """Type of the user's graphical session as logind registered it."""
+    def query(*arguments: str) -> str:
+        return subprocess.run(
+            ["loginctl", *arguments, "--value"],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=5,
+        ).stdout.strip()
+
+    try:
+        session = query("show-user", str(os.getuid()), "-p", "Display")
+        return query("show-session", session, "-p", "Type") if session else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def wayland_session() -> bool:
+    """True for a Wayland session, even before systemd imported its env."""
+    session_type = os.environ.get("XDG_SESSION_TYPE")
+    if session_type not in ("wayland", "x11"):
+        session_type = logind_session_type()
+    if session_type in ("wayland", "x11"):
+        return session_type == "wayland"
+    return bool(os.environ.get("WAYLAND_DISPLAY"))
+
+
 def discover_x11_display() -> None:
     """Find the session's X server when DISPLAY was not exported yet."""
     if os.environ.get("DISPLAY"):
@@ -603,6 +658,8 @@ def discover_x11_display() -> None:
         os.environ["DISPLAY"] = ":" + socket.name[1:]
         if authority:
             os.environ["XAUTHORITY"] = authority
+        if not x11_display_opens():
+            continue
         try:
             backend = XRandR()
         except Exception:
@@ -618,14 +675,15 @@ def create_backend() -> XRandR | MutterDisplayConfig:
         preferred = "mutter"
     if preferred not in ("auto", "x11", "mutter"):
         raise RuntimeError(f"unknown SOLAR_SCREEN_BACKEND value: {preferred}")
-    if preferred in ("auto", "x11"):
+    # XWayland exposes XRandR but its gamma ramps do not reach the CRTC, so
+    # a Wayland session never auto-selects X11 (nor probes its sockets).
+    wayland = wayland_session()
+    if preferred == "x11" or (preferred == "auto" and not wayland):
         discover_x11_display()
-    # XWayland exposes XRandR but its gamma ramps do not reach the CRTC.
-    backends = (
-        ("mutter", "x11")
-        if os.environ.get("XDG_SESSION_TYPE") == "wayland"
-        else ("x11", "mutter")
-    )
+    if wayland:
+        backends = ("mutter",) if preferred == "auto" else ("mutter", "x11")
+    else:
+        backends = ("x11", "mutter")
     errors: list[str] = []
     for backend in backends:
         if preferred not in ("auto", backend):
@@ -633,6 +691,9 @@ def create_backend() -> XRandR | MutterDisplayConfig:
         if backend == "x11":
             if not os.environ.get("DISPLAY"):
                 errors.append("DISPLAY is not set")
+                continue
+            if not x11_display_opens():
+                errors.append(f"cannot open X display {os.environ['DISPLAY']}")
                 continue
             try:
                 return XRandR()

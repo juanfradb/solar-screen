@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import subprocess
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -17,6 +18,8 @@ from solar_screen import (
     ramp_hash,
     solar_elevation,
     target_for_elevation,
+    wayland_session,
+    x11_display_opens,
 )
 from solar_table import SOLAR_RGB_TABLE
 
@@ -166,6 +169,58 @@ class MutterBackendTests(unittest.TestCase):
 
 
 class BackendSelectionTests(unittest.TestCase):
+    def setUp(self):
+        probe = patch("solar_screen.x11_display_opens", lambda timeout=3.0: True)
+        probe.start()
+        self.addCleanup(probe.stop)
+
+    def test_logind_wayland_skips_x11_before_env_import(self):
+        # The login unit starts before XDG_SESSION_TYPE is imported; probing
+        # X sockets there hung forever on mutter's setup display.
+        with patch.dict(os.environ, {}, clear=False), patch(
+            "solar_screen.logind_session_type", lambda: "wayland"
+        ), patch(
+            "solar_screen.discover_x11_display",
+            lambda: self.fail("must not probe X11"),
+        ), patch(
+            "solar_screen.XRandR", lambda: self.fail("must not use X11")
+        ), patch(
+            "solar_screen.MutterDisplayConfig", lambda: "mutter"
+        ):
+            for key in ("XDG_SESSION_TYPE", "WAYLAND_DISPLAY", "DISPLAY"):
+                os.environ.pop(key, None)
+            self.assertTrue(wayland_session())
+            self.assertEqual(create_backend(), "mutter")
+
+    def test_explicit_x11_session_ignores_logind_lookup(self):
+        with patch.dict(os.environ, {"XDG_SESSION_TYPE": "x11"}), patch(
+            "solar_screen.logind_session_type",
+            lambda: self.fail("env is authoritative"),
+        ):
+            self.assertFalse(wayland_session())
+
+    def test_wayland_without_mutter_does_not_fall_back_to_xwayland(self):
+        def missing():
+            raise RuntimeError("org.gnome.Mutter.DisplayConfig is not available")
+
+        with patch.dict(
+            os.environ, {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"}
+        ), patch(
+            "solar_screen.XRandR", lambda: self.fail("must not use X11")
+        ), patch("solar_screen.MutterDisplayConfig", missing):
+            with self.assertRaises(RuntimeError):
+                create_backend()
+
+    def test_unresponsive_display_is_skipped(self):
+        with patch.dict(
+            os.environ, {"XDG_SESSION_TYPE": "x11", "DISPLAY": ":1"}
+        ), patch(
+            "solar_screen.x11_display_opens", lambda timeout=3.0: False
+        ), patch(
+            "solar_screen.XRandR", lambda: self.fail("XOpenDisplay would hang")
+        ), patch("solar_screen.MutterDisplayConfig", lambda: "mutter"):
+            self.assertEqual(create_backend(), "mutter")
+
     def test_wayland_prefers_mutter(self):
         calls = []
         environment = {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"}
@@ -211,6 +266,15 @@ class BackendSelectionTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 create_backend()
+
+
+class X11ProbeTests(unittest.TestCase):
+    def test_probe_timeout_is_false(self):
+        def hang(*_args, **kwargs):
+            raise subprocess.TimeoutExpired("probe", kwargs["timeout"])
+
+        with patch("solar_screen.subprocess.run", hang):
+            self.assertFalse(x11_display_opens(timeout=0.1))
 
 
 if __name__ == "__main__":

@@ -49,8 +49,9 @@ solar-screen enable
 display LUT. `disable` restores the exact baseline LUT and the previous GNOME
 Night Light setting.
 
-The user service starts at login, before the graphical session, finds the X
-display and re-applies the ramp every second. Compositor resets (session
+The user service starts at login, before the graphical session, waits for the
+display backend (mutter on Wayland, as reported by logind; XRandR on X11) and
+re-applies the ramp every second. Compositor resets (session
 start, resume, monitor changes) are corrected within a second.
 
 ## GDM login screen
